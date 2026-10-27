@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Live cricket scores from Cricbuzz's live-scores page, for the Sports Hub bar widget.
+
+  cricket list     -> JSON of current matches (followed and live first), writes
+                      ~/.cache/omarchy/sports-hub/cricket.json and notifies on the toss,
+                      fours, sixes, wickets, milestones and results for followed teams
+
+Settings (~/.config/omarchy/sports-hub.json, see scripts/common.py):
+  "follow": ["India"], "notify": true, "ballAlerts": true, "quietWhenBusy": true
+"""
+import json, re, sys, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+import common
+from common import busy, settings
+
+CACHE = "cricket.json"
+BALLS = "cricket-balls.json"
+COMM = "https://www.cricbuzz.com/api/mcenter/comm/{}"
+SCARD = "https://www.cricbuzz.com/api/mcenter/scorecard/{}"
+BAT_MARKS = (50, 100, 150, 200, 250, 300)
+WKT_MARKS = (3, 4, 5)
+PART_MARKS = (50, 100, 150, 200)
+RECORD = re.compile(r"\brecords?\b|\bfastest\b|\byoungest\b|\boldest\b|\bhighest ever\b|\bfirst (?:ever|time)\b|\bmost \w+ (?:in|by|for)\b", re.I)
+URL = "https://www.cricbuzz.com/cricket-match/live-scores"
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
+
+
+def fetch():
+    req = urllib.request.Request(URL, headers={"User-Agent": UA, "Accept": "text/html"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+
+def newest_of(url, rank):
+    """Some Cricbuzz servers return an old copy, so ask three times and keep
+    the copy that ranks highest."""
+    def one():
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.load(r)
+    with ThreadPoolExecutor(3) as ex:
+        jobs = [ex.submit(one) for _ in range(3)]
+    got = []
+    for j in jobs:
+        try:
+            got.append(j.result())
+        except Exception:
+            pass
+    return max(got, key=rank) if got else None
+
+
+def commentary(mid):
+    return newest_of(COMM.format(mid), lambda d: max(
+        (c.get("timestamp", 0) for c in (d.get("matchCommentary") or {}).values()), default=0))
+
+
+def scorecard(mid):
+    return newest_of(SCARD.format(mid), lambda d: sum(
+        b.get("balls", 0) for i in d.get("scoreCard") or []
+        for b in ((i.get("bowlTeamDetails") or {}).get("bowlersData") or {}).values()))
+
+
+def flight_text(html):
+    """Next.js streams page data as self.__next_f.push([1,"<js string>"]) chunks."""
+    parts = []
+    for m in re.finditer(r'self\.__next_f\.push\(\[1,("(?:[^"\\]|\\.)*")\]\)', html):
+        try:
+            parts.append(json.loads(m.group(1)))
+        except ValueError:
+            pass
+    return "".join(parts)
+
+
+def objects_with(text, key):
+    """Every JSON object that directly contains `key`, found by brace matching."""
+    out, seen = [], set()
+    for m in re.finditer(re.escape('"' + key + '":'), text):
+        start = text.rfind("{", 0, m.start())
+        depth, i, in_str, esc = 0, start, False, False
+        while i < len(text):
+            c = text[i]
+            if in_str:
+                esc = (c == "\\" and not esc)
+                if c == '"' and not esc:
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        chunk = text[start:i + 1]
+        try:
+            obj = json.loads(chunk)
+        except ValueError:
+            continue
+        mid = obj.get(key, {}).get("matchId")
+        if mid and mid not in seen:
+            seen.add(mid)
+            out.append(obj)
+    return out
+
+
+def innings_text(team, score):
+    parts = []
+    for k in ("inngs1", "inngs2"):
+        i = (score or {}).get(k)
+        if not i:
+            continue
+        runs, wkts, overs = i.get("runs", 0), i.get("wickets"), i.get("overs")
+        s = f"{runs}" + (f"/{wkts}" if wkts is not None and wkts != 10 else "")
+        if overs is not None:
+            s += f" ({overs})"
+        parts.append(s)
+    return " & ".join(parts)
+
+
+def match_types(text):
+    """matchId -> International / League / Domestic / Women, from the page's
+    grouped list ({"matchType": "International", "seriesMatches": [...]}, ...)."""
+    heads = [(m.start(), m.group(1)) for m in re.finditer(r'\{"matchType":"([^"]+)","seriesMatches"', text)]
+    types = {}
+    for n, (start, kind) in enumerate(heads):
+        end = heads[n + 1][0] if n + 1 < len(heads) else len(text)
+        for m in re.finditer(r'"matchId":(\d+)', text[start:end]):
+            types.setdefault(int(m.group(1)), kind)
+    return types
+
+
+def parse(html):
+    matches = []
+    text = flight_text(html)
+    types = match_types(text)
+    for o in objects_with(text, "matchInfo"):
+        info, score = o["matchInfo"], o.get("matchScore") or {}
+        t1, t2 = info.get("team1", {}), info.get("team2", {})
+        state = info.get("state", "")
+        live = state in ("In Progress", "Innings Break", "Toss", "Delay", "Stumps", "Lunch", "Tea", "Rain", "Drink")
+        kind = types.get(info["matchId"]) or (info.get("matchType") or "").capitalize()
+        matches.append({
+            "id": info["matchId"], "type": kind, "series": info.get("seriesName", ""), "desc": info.get("matchDesc", ""),
+            "format": info.get("matchFormat", ""), "state": state, "status": info.get("status", ""),
+            "start": int(info.get("startDate", 0)) // 1000, "live": live,
+            "team1": {"name": t1.get("teamName", ""), "short": t1.get("teamSName", ""), "score": innings_text(t1, score.get("team1Score"))},
+            "team2": {"name": t2.get("teamName", ""), "short": t2.get("teamSName", ""), "score": innings_text(t2, score.get("team2Score"))},
+            "venue": (info.get("venueInfo") or {}).get("city", ""),
+            "url": f"https://www.cricbuzz.com/live-cricket-scores/{info['matchId']}",
+        })
+    return matches
+
+
+def progress(m):
+    """How far a match has got: finished first, then balls bowled, then runs."""
+    balls = runs_ = 0
+    for side in ("team1", "team2"):
+        for inn in m[side]["score"].split(" & "):
+            o = re.search(r"\((\d+)(?:\.(\d))?\)", inn)
+            if o:
+                balls += int(o.group(1)) * 6 + int(o.group(2) or 0)
+            r = re.match(r"(\d+)", inn)
+            runs_ += int(r.group(1)) if r else 0
+    return (m["state"] == "Complete", balls, runs_)
+
+
+def freshest(*lists):
+    """Cricbuzz's servers sometimes hand out a page that is minutes old, so a
+    score can jump backwards. Keep, per match, the copy that is furthest along."""
+    best = {}
+    for ms in lists:
+        for m in ms:
+            if m["id"] not in best or progress(m) > progress(best[m["id"]]):
+                best[m["id"]] = m
+    return best
+
+
+def wickets(m, side):
+    s = m[side]["score"].split(" & ")[-1]
+    w = re.match(r"\d+/(\d+)", s)
+    return int(w.group(1)) if w else (10 if re.match(r"^\d+ \(", s) else 0)
+
+
+def runs(m, side):
+    s = m[side]["score"].split(" & ")[-1]
+    r = re.match(r"(\d+)", s)
+    return int(r.group(1)) if r else 0
+
+
+def notify(title, body):
+    common.notify(title, body, "󰙨")
+
+
+def followed(m, follow):
+    names = {m["team1"]["name"].lower(), m["team2"]["name"].lower(), m["team1"]["short"].lower(), m["team2"]["short"].lower()}
+    return any(f.lower() in names for f in follow)
+
+
+def bat_runs(c):
+    """(runs to the batter, counts as a ball faced) for one commentary ball."""
+    t = re.sub(r"<[^>]+>", "", c.get("commText", "")).split(",", 2)
+    what = (t[1] if len(t) > 1 else "").strip().lower()
+    if "wide" in what:
+        return 0, False
+    if "bye" in what:
+        return 0, True
+    ev = {e.lower() for e in c.get("event") or []}
+    if "six" in ev or what == "six":
+        return 6, True
+    if "four" in ev or what == "four":
+        return 4, True
+    n = re.match(r"(\d+) runs?", what)
+    return (int(n.group(1)) if n else 0), True
+
+
+def crossed(old, new, marks):
+    """The highest mark passed since last time (one popup, not several)."""
+    hit = [k for k in marks if old < k <= new]
+    return hit[-1:]
+
+
+def milestones(m, st, card):
+    """Batter 50/100/…, bowler 3/4/5-wicket hauls and partnership 50/100/…
+    from the scorecard. Keeps the highest value seen, so an old copy of the
+    scorecard can't trigger anything twice."""
+    seed = "max" not in st
+    best = st.setdefault("max", {})
+    for inn in card.get("scoreCard") or []:
+        n = inn.get("inningsId")
+        bat = inn.get("batTeamDetails") or {}
+        bowl = inn.get("bowlTeamDetails") or {}
+        team = bat.get("batTeamShortName", "")
+        for b in (bat.get("batsmenData") or {}).values():
+            k, r = f"bat:{n}:{b.get('batId')}", b.get("runs", 0)
+            for mark in ([] if seed else crossed(best.get(k, 0), r, BAT_MARKS)):
+                word = {50: "FIFTY", 100: "HUNDRED", 200: "DOUBLE HUNDRED", 300: "TRIPLE HUNDRED"}.get(mark, str(mark))
+                notify(f"🏏 {word}! {b.get('batName')} {r}{'*' if b.get('outDesc') == 'batting' else ''}({b.get('balls')})",
+                       f"{b.get('fours', 0)}×4 · {b.get('sixes', 0)}×6 · SR {b.get('strikeRate')} · {team}")
+            best[k] = max(best.get(k, 0), r)
+        for w in (bowl.get("bowlersData") or {}).values():
+            k, x = f"bowl:{n}:{w.get('bowlerId')}", w.get("wickets", 0)
+            for mark in ([] if seed else crossed(best.get(k, 0), x, WKT_MARKS)):
+                notify(f"🎯 {'FIVE-WICKET HAUL' if mark == 5 else f'{mark} wickets'}! {w.get('bowlName')}",
+                       f"{x}/{w.get('runs')} in {w.get('overs')} ov · {bowl.get('bowlTeamShortName', '')} vs {team}")
+            best[k] = max(best.get(k, 0), x)
+        for pk, pt in (inn.get("partnershipsData") or {}).items():
+            k, r = f"part:{n}:{pk}", pt.get("totalRuns", 0)
+            for mark in ([] if seed else crossed(best.get(k, 0), r, PART_MARKS)):
+                notify(f"🤝 {mark} partnership — {team}",
+                       f"{pt.get('bat1Name')} {pt.get('bat1Runs')} & {pt.get('bat2Name')} {pt.get('bat2Runs')} · {r} off {pt.get('totalBalls')} balls")
+            best[k] = max(best.get(k, 0), r)
+
+
+def ball_events(m, seen, s):
+    """Notify fours, sixes, wickets (with batter and bowler), milestones and
+    records for one match. Returns False when the feed couldn't be read."""
+    key = str(m["id"])
+    st = seen.get(key)
+    if not isinstance(st, dict):
+        st = {"ts": st} if st else {}
+    seen[key] = st
+    card = scorecard(m["id"])
+    if card:
+        milestones(m, st, card)
+    # Batter and team scores by innings, for the popups.
+    bats, teams, card_over = {}, {}, {}
+    for inn in (card or {}).get("scoreCard") or []:
+        n, sd = inn.get("inningsId"), inn.get("scoreDetails") or {}
+        bt = inn.get("batTeamDetails") or {}
+        teams[n] = f"{bt.get('batTeamShortName', '')} {sd.get('runs', 0)}/{sd.get('wickets', 0)} ({sd.get('overs', 0)})"
+        card_over[n] = float(sd.get("overs") or 0)
+        for b in (bt.get("batsmenData") or {}).values():
+            bats[(n, b.get("batId"))] = b
+    d = commentary(m["id"])
+    if not d:
+        return False
+    comm = sorted((d.get("matchCommentary") or {}).values(), key=lambda c: c.get("timestamp", 0))
+    if not comm:
+        return True
+    last = st.get("ts")
+    st["ts"] = max(last or 0, comm[-1].get("timestamp", 0))
+    if last is None:                        # first look at this match: no backlog
+        return True
+    new = [c for c in comm if c.get("timestamp", 0) > last]
+    for c in [c for c in new if c.get("ballMetric") is not None][-4:]:
+        ev = {e.lower() for e in c.get("event") or []}
+        raw = c.get("commText", "")
+        batter = (c.get("batsmanDetails") or {}).get("playerName", "")
+        bowler = (c.get("bowlerDetails") or {}).get("playerName", "")
+        n, pid = c.get("inningsId"), (c.get("batsmanDetails") or {}).get("playerId")
+        b = bats.get((n, pid))
+        me = ""
+        if b:
+            # The scorecard may be ahead of or behind this ball: replay the
+            # batter's balls in between to get the score right after it.
+            r, f, at = b["runs"], b["balls"], card_over.get(n, 0)
+            for x in comm:
+                xm = x.get("ballMetric")
+                if xm is None or x.get("inningsId") != n or (x.get("batsmanDetails") or {}).get("playerId") != pid:
+                    continue
+                dr, faced = bat_runs(x)
+                if at < xm <= c["ballMetric"]:
+                    r, f = r + dr, f + faced
+                elif c["ballMetric"] < xm <= at:
+                    r, f = r - dr, f - faced
+            me = f" {r}({f})"
+        score = f"{c.get('ballMetric')} ov" + (f" · now {teams[n]}" if n in teams else f" · {c.get('teamName', '')}")
+        if "wicket" in ev or "<b>out</b>" in raw.lower():
+            # The dismissal is in bold: "<b>Abhishek Sharma c Wanuja Sahan b Sahan Arachchige 7(3)</b>"
+            bold = [re.sub(r"\s+", " ", b).strip() for b in re.findall(r"<b>(.*?)</b>", raw)]
+            how = next((b for b in bold if batter and b.startswith(batter)), "")
+            if not how:
+                how = re.sub(r"<[^>]+>", "", raw).split(",", 1)[-1].strip()[:120]
+            notify(f"🏏 WICKET! {batter} out", f"{how}\nBowler: {bowler} · {score}")
+            common.companion(s, f"Arre yaar… {batter} out! 😞", "sad")
+        elif "six" in ev:
+            notify(f"🏏 SIX! {batter}{me}", f"off {bowler} · {score}")
+            common.companion(s, f"SIXXX!! 🔥 {batter}{me}")
+        elif "four" in ev:
+            notify(f"🏏 FOUR! {batter}{me}", f"off {bowler} · {score}")
+            common.companion(s, f"FOUR! 🏏 {batter}{me}")
+    # Records the commentators mention: "fastest fifty", "youngest to…", "record".
+    for c in [c for c in new if RECORD.search(re.sub(r"<[^>]+>", "", c.get("commText", "")))][-2:]:
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", c.get("commText", ""))).strip()
+        sentence = next((x.strip() for x in re.split(r"(?<=[.!?])\s+", text) if RECORD.search(x)), text)
+        notify("🏆 Record", sentence[:200])
+    return True
+
+
+def events(prev, cur, s, ball_ok=()):
+    """Notify on toss, wickets, team milestones and the result, for followed teams."""
+    if not s["notify"] or (s["quietWhenBusy"] and busy()):
+        return
+    old = {m["id"]: m for m in prev}
+    for m in cur:
+        was = old.get(m["id"])
+        if not was or not followed(m, s["follow"]):
+            continue
+        line = f"{m['team1']['short']} {m['team1']['score'] or '-'}  ·  {m['team2']['short']} {m['team2']['score'] or '-'}"
+        if was["state"] != "Complete" and m["state"] == "Complete":
+            notify("🏏 " + m["status"], f"{m['desc']} · {line}")
+            continue
+        toss = re.compile(r"opt to|won the toss", re.I)
+        if toss.search(m["status"]) and not toss.search(was["status"]):
+            notify("🏏 Toss: " + m["status"], f"{m['desc']} · {m['series']}")
+        for side in ("team1", "team2"):
+            now_inns = m[side]["score"].split(" & ")[-1]
+            if m["id"] not in ball_ok and wickets(m, side) > wickets(was, side):
+                notify(f"🏏 Wicket! {m[side]['short']} {now_inns}", f"{m['desc']} · {m['status']}")
+            for mark in (100, 200, 300, 400):
+                if runs(was, side) < mark <= runs(m, side):
+                    notify(f"🏏 {m[side]['short']} reach {mark}", line)
+
+
+def main(a):
+    if a[:1] != ["list"]:
+        print(__doc__); sys.exit(2)
+    s = settings()
+    # Reuse a result another bar wrote moments ago, so each ball is announced once.
+    lock = common.locked(CACHE)
+    cached = common.load(CACHE)
+    if time.time() - cached.get("at", 0) < 15 and "matches" in cached:
+        print(json.dumps(cached)); return
+    with ThreadPoolExecutor(3) as ex:
+        jobs = [ex.submit(lambda: parse(fetch())) for _ in range(3)]
+    pages, err = [], None
+    for j in jobs:
+        try:
+            pages.append(j.result())
+        except Exception as e:
+            err = e
+    if not pages:
+        print(json.dumps({"error": f"Couldn't load scores: {err}"})); sys.exit(1)
+    prev = cached.get("matches", [])
+    # Matches on the newest page, each in its most advanced known state.
+    best = freshest(prev, *pages)
+    cur = [best[m["id"]] for m in max(pages, key=len)]
+    # Fours, sixes and wickets with player names for followed live matches.
+    ball_ok = set()
+    if s["notify"] and s.get("ballAlerts", True):
+        seen = common.load(BALLS)
+        quiet = s["quietWhenBusy"] and busy()
+        for m in cur:
+            if m["live"] and followed(m, s["follow"]):
+                if quiet:
+                    seen.pop(str(m["id"]), None)    # skip what happened during the meeting
+                elif ball_events(m, seen, s):
+                    ball_ok.add(m["id"])
+        common.save(BALLS, seen)
+    events(prev, cur, s, ball_ok)
+    fol = [m for m in cur if followed(m, s["follow"])]
+    # Followed teams, then internationals, then whatever is live, soonest first.
+    cur.sort(key=lambda m: (not followed(m, s["follow"]), m.get("type") != "International", not m["live"], m["start"]))
+    data = {"at": int(time.time()), "follow": s["follow"], "matches": cur,
+            "headline": next((m for m in fol if m["live"]), None)}
+    common.save(CACHE, data)
+    print(json.dumps(data))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

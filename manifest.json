@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.rajshimpi.sports-hub",
+  "name": "Sports Hub",
+  "version": "2.0.0",
+  "author": "Raj Shimpi",
+  "license": "MIT",
+  "description": "Every sport in one bar widget: live cricket with ball-by-ball alerts (fours, sixes, wickets, milestones), football, Formula 1, tennis, basketball, NFL, hockey, baseball, golf and MMA, with a Live tab for everything on right now. Follow teams and players for goals and results. Quiet during meetings.",
+  "repository": "https://github.com/RajShimpi/omarchy-sports-hub",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Sports Hub",
+    "description": "Live cricket, football, F1, tennis, NBA, NFL, NHL, MLB, golf and MMA",
+    "category": "Info",
+    "aliases": ["sports", "cricket", "football", "soccer", "f1", "scores"],
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}

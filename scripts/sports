@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Every sport except cricket, for the Sports Hub bar widget: ESPN's public
+scoreboards (football, tennis, basketball, NFL, hockey, baseball, golf, MMA)
+and Formula 1 from Jolpica (the Ergast API).
+
+  sports list    -> JSON {tabs, events: {<tab>: [...]}, f1: {...}}, writes
+                    ~/.cache/omarchy/sports-hub/sports.json and notifies on goals,
+                    starts and results of followed teams and before each F1 race
+  sports edit    -> create ~/.config/omarchy/sports-hub.json if missing and open it
+
+Settings (~/.config/omarchy/sports-hub.json, see scripts/common.py):
+  "tabs": [...], "followTeams": ["Liverpool", "Carlos Alcaraz"],
+  "football": ["eng.1", "uefa.champions"], "leagues": {"basketball": ["nba"], ...}, "f1": true
+Football league codes: eng.1 Premier League, esp.1 LaLiga, ger.1 Bundesliga, ita.1 Serie A,
+fra.1 Ligue 1, ind.1 ISL, usa.1 MLS, uefa.champions, uefa.europa, fifa.world ...
+"""
+import json, os, sys, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+import common
+from common import busy, settings
+
+CACHE = "sports.json"
+ESPN = "https://site.api.espn.com/apis/site/v2/sports/{}/{}/scoreboard"
+F1 = "https://api.jolpi.ca/ergast/f1/current/{}.json"
+# tab -> ESPN sport path
+SPORTS = {"football": "soccer", "tennis": "tennis", "basketball": "basketball", "nfl": "football",
+          "hockey": "hockey", "baseball": "baseball", "golf": "golf", "mma": "mma"}
+GLYPH = "󰒸"
+PER_TAB = 30
+
+
+def get(url):
+    # No User-Agent on purpose: ESPN refuses browser-like and custom ones.
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.load(r)
+
+
+def ts(iso):
+    try:
+        return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
+    except (ValueError, AttributeError):
+        return 0
+
+
+def status(obj):
+    st = (obj.get("status") or {}).get("type") or {}
+    return st.get("state", "pre"), st.get("shortDetail") or st.get("detail") or st.get("description", "")
+
+
+def link(obj, *rels):
+    for l in obj.get("links") or []:
+        if not rels or set(rels) & set(l.get("rel") or []):
+            return l.get("href", "")
+    return ""
+
+
+def teams(tab, code, d):
+    """Team sports: football, basketball, NFL, hockey, baseball."""
+    lg = (d.get("leagues") or [{}])[0]
+    name = lg.get("name", code) if tab == "football" else lg.get("abbreviation") or lg.get("name", code)
+    out = []
+    for e in d.get("events", []):
+        comp = (e.get("competitions") or [{}])[0]
+        # Football lists the home side first, the US sports "away at home".
+        sides = sorted(comp.get("competitors") or [], key=lambda c: (c.get("homeAway") == "home") != (tab == "football"))
+        if len(sides) != 2:
+            continue
+        state, detail = status(e)
+        out.append({
+            "id": f"{tab}:{e['id']}", "sport": tab, "kind": "match", "league": name, "start": ts(e.get("date")),
+            "state": state, "detail": detail,
+            "rows": [{"name": c["team"].get("displayName", ""), "short": c["team"].get("abbreviation", ""),
+                      "score": c.get("score", "") if state != "pre" else "", "win": bool(c.get("winner"))} for c in sides],
+            "url": link(e, "summary") or link(e),
+        })
+    return out
+
+
+def tennis(tab, code, d):
+    """Singles matches of each tournament: live ones, today's results and the next day's play."""
+    now, out = time.time(), []
+    for e in d.get("events", []):
+        for g in e.get("groupings") or []:
+            group = (g.get("grouping") or {}).get("displayName", "")
+            if "doubles" in group.lower():
+                continue
+            for c in g.get("competitions") or []:
+                state, detail = status(c)
+                start = ts(c.get("date"))
+                if state == "pre" and start - now > 86400 or state == "post" and now - start > 86400:
+                    continue
+                players = sorted(c.get("competitors") or [], key=lambda x: x.get("order", 0))
+                names = [(p.get("athlete") or {}).get("displayName", "") for p in players]
+                if len(players) != 2 or not all(names) or "TBD" in names:
+                    continue
+                round_ = (c.get("round") or {}).get("displayName", "")
+                out.append({
+                    "id": f"tennis:{c['id']}", "sport": tab, "kind": "match", "start": start,
+                    "league": f"{code.upper()} · {e.get('name', '')}" + (f" · {round_}" if round_ else ""),
+                    "state": state, "detail": detail,
+                    "rows": [{"name": p["athlete"].get("displayName", ""), "short": p["athlete"].get("shortName", ""),
+                              "score": " ".join(str(int(l.get("value", 0))) for l in p.get("linescores") or []),
+                              "win": bool(p.get("winner"))} for p in players],
+                    "url": link(e) or "https://www.espn.com/tennis/scoreboard",
+                })
+    return out
+
+
+def golf(tab, code, d):
+    """One leaderboard card per tournament: the top five."""
+    out = []
+    for e in d.get("events", []):
+        comp = (e.get("competitions") or [{}])[0]
+        state, detail = status(e)
+        board = sorted(comp.get("competitors") or [], key=lambda c: c.get("order", 999))[:5]
+        out.append({
+            "id": f"golf:{e['id']}", "sport": tab, "kind": "board", "league": code.upper(), "title": e.get("name", ""),
+            "start": ts(e.get("date")), "state": state, "detail": detail,
+            "rows": [{"name": f"{c.get('order', '')}. {(c.get('athlete') or {}).get('displayName', '')}",
+                      "short": (c.get("athlete") or {}).get("shortName", ""), "score": str(c.get("score", "")), "win": False}
+                     for c in board],
+            "url": link(e) or "https://www.espn.com/golf/leaderboard",
+        })
+    return out
+
+
+def mma(tab, code, d):
+    """One card per fight night: the main card, main event first."""
+    out = []
+    for e in d.get("events", []):
+        state, detail = status(e)
+        fights = []
+        for c in reversed((e.get("competitions") or [])[-5:]):
+            names = [(x.get("athlete") or {}).get("displayName", "") for x in sorted(c.get("competitors") or [], key=lambda x: x.get("order", 0))]
+            winner = next(((x.get("athlete") or {}).get("displayName", "") for x in c.get("competitors") or [] if x.get("winner")), "")
+            fights.append({"name": " vs ".join(names), "short": "",
+                           "score": ("W: " + winner.split()[-1]) if winner else (c.get("type") or {}).get("abbreviation", ""),
+                           "win": False})
+        out.append({
+            "id": f"mma:{e['id']}", "sport": tab, "kind": "board", "league": code.upper(), "title": e.get("name", ""),
+            "start": ts(e.get("date")), "state": state, "detail": detail, "rows": fights,
+            "url": link(e) or "https://www.espn.com/mma/schedule",
+        })
+    return out
+
+
+PARSERS = {"tennis": tennis, "golf": golf, "mma": mma}
+
+
+def scoreboard(job):
+    tab, code = job
+    try:
+        d = get(ESPN.format(SPORTS[tab], code))
+    except Exception:
+        return tab, None
+    try:
+        return tab, PARSERS.get(tab, teams)(tab, code, d)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return tab, None
+
+
+def f1():
+    out = {}
+    try:
+        r = get(F1.format("next"))["MRData"]["RaceTable"]["Races"]
+        if r:
+            race = r[0]
+            out["next"] = {"name": race["raceName"], "round": race["round"], "circuit": race["Circuit"]["circuitName"],
+                           "country": race["Circuit"]["Location"]["country"],
+                           "start": ts(race["date"] + "T" + race.get("time", "12:00:00Z")),
+                           "qualifying": ts(race["Qualifying"]["date"] + "T" + race["Qualifying"].get("time", "12:00:00Z")) if race.get("Qualifying") else 0,
+                           "url": race.get("url", "")}
+    except Exception:
+        pass
+    try:
+        r = get(F1.format("last/results"))["MRData"]["RaceTable"]["Races"]
+        if r:
+            out["last"] = {"name": r[0]["raceName"], "podium": [
+                f"{x['position']}. {x['Driver']['givenName'][0]}. {x['Driver']['familyName']} ({x['Constructor']['name']})" for x in r[0]["Results"][:3]]}
+    except Exception:
+        pass
+    try:
+        lst = get(F1.format("driverStandings"))["MRData"]["StandingsTable"]["StandingsLists"]
+        if lst:
+            out["standings"] = [f"{d['position']}. {d['Driver']['familyName']}  {d['points']} pts" for d in lst[0]["DriverStandings"][:5]]
+    except Exception:
+        pass
+    return out
+
+
+def followed(e, follow):
+    for r in e["rows"]:
+        name, short = r["name"].lower(), r["short"].lower()
+        for f in follow:
+            if f == name or f == short or (len(f) > 3 and f in name):
+                return True
+    return False
+
+
+def line(e):
+    a, b = e["rows"][:2]
+    return f"{a['short'] or a['name']} {a['score']} – {b['score']} {b['short'] or b['name']}"
+
+
+def alerts(prev, events, s):
+    """Goals and results of followed teams and players, and race starts."""
+    old = {e["id"]: e for lst in (prev.get("events") or {}).values() for e in lst}
+    for lst in events.values():
+        for e in lst:
+            o = old.get(e["id"])
+            if not o or not e.get("follow") or e["kind"] != "match":
+                continue
+            if e["sport"] == "football" and o["state"] == e["state"] == "in" and [r["score"] for r in e["rows"]] != [r["score"] for r in o["rows"]]:
+                common.notify("⚽ Goal! " + line(e), e["league"] + " · " + e["detail"], GLYPH)
+            elif o["state"] == "pre" and e["state"] == "in":
+                common.notify("Started: " + " v ".join(r["name"] for r in e["rows"]), e["league"], GLYPH)
+            elif o["state"] != "post" and e["state"] == "post":
+                win = next((r["name"] for r in e["rows"] if r["win"]), "")
+                common.notify(("Final: " if not win else f"{win} won · ") + line(e), e["league"], GLYPH)
+
+
+def main(a):
+    if a[:1] == ["edit"]:
+        common.write_default_config()
+        os.execvp("omarchy-launch-editor", ["omarchy-launch-editor", common.CONF])
+    if a[:1] != ["list"]:
+        print(__doc__); sys.exit(2)
+    s = settings()
+    # Reuse a result another bar wrote moments ago, so each goal is announced once.
+    lock = common.locked(CACHE)
+    prev = common.load(CACHE)
+    if time.time() - prev.get("at", 0) < 15 and prev.get("tabs") == s["tabs"]:
+        print(json.dumps(prev)); return
+    jobs = [(tab, code) for tab in s["tabs"] if tab in SPORTS
+            for code in (s["football"] if tab == "football" else s["leagues"].get(tab, []))]
+    events = {tab: [] for tab in s["tabs"] if tab in SPORTS}
+    failed = set()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for tab, got in pool.map(scoreboard, jobs):
+            if got is None:
+                failed.add(tab)
+            else:
+                events[tab] += got
+    follow = [f.lower() for f in s["followTeams"]]
+    rank = {"in": 0, "pre": 1, "post": 2}
+    for tab, lst in events.items():
+        if tab in failed and not lst:
+            lst += (prev.get("events") or {}).get(tab, [])    # keep the last good copy through a hiccup
+        for e in lst:
+            e["follow"] = followed(e, follow)
+        lst.sort(key=lambda e: (not e["follow"], rank.get(e["state"], 3), e["start"] if e["state"] != "post" else -e["start"]))
+        del lst[PER_TAB:]
+    data = {"at": int(time.time()), "tabs": s["tabs"], "follow": s["follow"], "followTeams": s["followTeams"],
+            "events": events, "f1": f1() if s["f1"] and "f1" in s["tabs"] else {}}
+
+    quiet = not s["notify"] or (s["quietWhenBusy"] and busy())
+    if not quiet:
+        alerts(prev, events, s)
+    nxt = data["f1"].get("next")
+    if nxt and 0 < nxt["start"] - time.time() <= 1800 and prev.get("f1Reminded") != nxt["round"]:
+        if not quiet:
+            common.notify("🏎 " + nxt["name"] + " starts in 30 min", nxt["circuit"], GLYPH)
+        data["f1Reminded"] = nxt["round"]
+    else:
+        data["f1Reminded"] = prev.get("f1Reminded")
+
+    common.save(CACHE, data)
+    print(json.dumps(data))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
